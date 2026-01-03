@@ -5,7 +5,7 @@
 
 class Trigger
   var trig, f, id
-  var o             # optional object
+  var o             # optional object, for Cron it contains the cron object, for rule, 'true' means run-once
 
   # trig: trigger of the event, either timestamp (int) or a rule matcher instance
   # f: function or closure to call
@@ -20,9 +20,12 @@ class Trigger
   end
 
   def tostring()
-    import string
-    return string.format("<instance: %s(%s, %s, %s)", str(classof(self)),
+    return format("<instance: %s(%s, %s, %s)", str(classof(self)),
               str(self.trig), str(self.f), str(self.id))
+  end
+
+  def run_once()
+    return self.o == true
   end
 
   ###########################################################################################

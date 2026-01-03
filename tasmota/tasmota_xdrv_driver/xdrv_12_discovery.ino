@@ -35,7 +35,8 @@
 void TasDiscoverMessage(void) {
   uint32_t ip_address = (uint32_t)WiFi.localIP();
   char* hostname = TasmotaGlobal.hostname;
-#if defined(ESP32) && CONFIG_IDF_TARGET_ESP32 && defined(USE_ETHERNET)
+//#if defined(ESP32) && CONFIG_IDF_TARGET_ESP32 && defined(USE_ETHERNET)
+#if defined(ESP32) && defined(USE_ETHERNET)
   if (static_cast<uint32_t>(EthernetLocalIP()) != 0) {
     ip_address = (uint32_t)EthernetLocalIP();
     hostname = EthernetHostname();
@@ -45,7 +46,7 @@ void TasDiscoverMessage(void) {
                    "\"dn\":\"%s\","                            // Device Name
                    "\"fn\":["),                                // Friendly Names (start)
                    ip_address,
-                   SettingsText(SET_DEVICENAME));
+                   EscapeJSONString(SettingsText(SET_DEVICENAME)).c_str());
 
   uint32_t maxfn = (TasmotaGlobal.devices_present > MAX_FRIENDLYNAMES) ? MAX_FRIENDLYNAMES : (!TasmotaGlobal.devices_present) ? 1 : TasmotaGlobal.devices_present;
   for (uint32_t i = 0; i < MAX_FRIENDLYNAMES; i++) {
@@ -68,6 +69,7 @@ void TasDiscoverMessage(void) {
                    "\"mac\":\"%s\","                           // Full MAC as Device id
                    "\"md\":\"%s\","                            // Module or Template Name
                    "\"ty\":%d,\"if\":%d,"                      // Flag for TuyaMCU and Ifan devices
+                   "\"cam\":%d,"                               // Flag for ESP32-cam
                    "\"ofln\":\"" MQTT_LWT_OFFLINE "\","        // Payload Offline
                    "\"onln\":\"" MQTT_LWT_ONLINE "\","         // Payload Online
                    "\"state\":[\"%s\",\"%s\",\"%s\",\"%s\"],"  // State text for "OFF","ON","TOGGLE","HOLD"
@@ -80,6 +82,11 @@ void TasDiscoverMessage(void) {
                    NetworkUniqueId().c_str(),
                    ModuleName().c_str(),
                    TuyaMod, iFanMod,
+#ifdef ESP32
+                   TasmotaGlobal.camera_initialized,
+#else
+                   false,
+#endif
                    GetStateText(0), GetStateText(1), GetStateText(2), GetStateText(3),
                    TasmotaGlobal.version,
                    TasmotaGlobal.mqtt_topic,
@@ -109,22 +116,23 @@ void TasDiscoverMessage(void) {
 
   uint16_t Relay[MAX_RELAYS_SET] = { 0 };                      // Base array to store the relay type
   uint16_t Shutter[MAX_RELAYS_SET] = { 0 };                    // Array to store a temp list for shutters
-  for (uint32_t i = 0; i < MAX_RELAYS_SET; i++) {
-    if (i < TasmotaGlobal.devices_present) {
 
 #ifdef USE_SHUTTER
-      if (Settings->flag3.shutter_mode) {
-        for (uint32_t k = 0; k < MAX_SHUTTERS; k++) {
-          if (Settings->shutter_startrelay[k] > 0) {
-            Shutter[Settings->shutter_startrelay[k]-1] = Shutter[Settings->shutter_startrelay[k]] = 1;
-          } else {
-            // terminate loop at first INVALID Settings->shutter_startrelay[i].
-            break;
-          }
-        }
+  if (Settings->flag3.shutter_mode) {
+    for (uint32_t k = 0; k < TasmotaGlobal.shutters_present; k++) {
+      uint8_t sr = ShutterGetStartRelay(k);
+      if (sr > 0) {
+        Shutter[sr-1] = Shutter[sr] = 1;
+      } else {
+        // terminate loop at first INVALID ShutterGetStartRelay(k).
+        break;
       }
+    }
+  }
 #endif  // USE_SHUTTER
 
+  for (uint32_t i = 0; i < MAX_RELAYS_SET; i++) {
+    if (i < TasmotaGlobal.devices_present) {
       if (Shutter[i] != 0) {                                   // Check if there are shutters present
         Relay[i] = 3;                                          // Relay is a shutter
       } else {
@@ -184,6 +192,8 @@ void TasDiscoverMessage(void) {
                                 "\"117\":%d},"
                         "\"lk\":%d,"                           // Light CTRGB linked
                         "\"lt_st\":%d,"                        // Light SubType
+                        "\"bat\":%d,"                          // Battery operates yes/no
+                        "\"dslp\":%d,"                         // Deepsleep configured yes/no
                         "\"sho\":["),                          // Shutter Options (start)
                         Settings->flag.mqtt_response,
                         Settings->flag.button_swap,
@@ -197,11 +207,14 @@ void TasDiscoverMessage(void) {
                         Settings->flag5.mqtt_switches,
                         Settings->flag5.fade_fixed_duration,
                         light_controller_isCTRGBLinked,
-                        light_subtype);
+                        light_subtype,
+                        (Settings->battery_level_percent == 101) ? 0 : 1,
+                        (Settings->deepsleep == 0) ? 0 : 1
+                        );
 
-  for (uint32_t i = 0; i < MAX_SHUTTERS; i++) {
+  for (uint32_t i = 0; i < TasmotaGlobal.shutters_present; i++) {
 #ifdef USE_SHUTTER
-    ResponseAppend_P(PSTR("%s%d"), (i > 0 ? "," : ""), Settings->shutter_options[i]);
+    ResponseAppend_P(PSTR("%s%d"), (i > 0 ? "," : ""), ShutterGetOptions(i));
 #else
     ResponseAppend_P(PSTR("%s0"), (i > 0 ? "," : ""));
 #endif  // USE_SHUTTER
@@ -209,12 +222,12 @@ void TasDiscoverMessage(void) {
 
   ResponseAppend_P(PSTR("],"                                   // Shutter Options (end)
                         "\"sht\":["));                         // Shutter Tilt (start)
-  for (uint32_t i = 0; i < MAX_SHUTTERS; i++) {
+  for (uint32_t i = 0; i < TasmotaGlobal.shutters_present; i++) {
 #ifdef USE_SHUTTER
     ResponseAppend_P(PSTR("%s[%d,%d,%d]"), (i > 0 ? "," : ""),
-                          Settings->shutter_tilt_config[0][i],
-                          Settings->shutter_tilt_config[1][i],
-                          Settings->shutter_tilt_config[2][i]);
+                          ShutterGetTiltConfig(0,i),
+                          ShutterGetTiltConfig(1,i),
+                          ShutterGetTiltConfig(2,i));
 #else
     ResponseAppend_P(PSTR("%s[0,0,0]"), (i > 0 ? "," : ""));
 #endif  // USE_SHUTTER
@@ -321,6 +334,9 @@ bool Xdrv12(uint32_t function) {
       break;
     case FUNC_MQTT_INIT:
       TasDiscoverInit();
+      break;
+    case FUNC_ACTIVE:
+      result = true;
       break;
     }
   }

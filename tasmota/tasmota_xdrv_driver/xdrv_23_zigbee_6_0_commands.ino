@@ -454,7 +454,7 @@ void convertClusterSpecific(class Z_attribute_list &attr_list, uint16_t cluster,
 
           JsonGeneratorArray group_list;
           for (uint32_t i = 0; i < xyz.y; i++) {
-            group_list.add(payload.get16(2 + 2*i));
+            group_list.add((uint32_t)payload.get16(2 + 2*i));
           }
           attr_list.addAttribute(command_name, true).setStrRaw(group_list.toString().c_str());
         }
@@ -509,18 +509,10 @@ void convertClusterSpecific(class Z_attribute_list &attr_list, uint16_t cluster,
         break;
       }
     } else {  // general case
-      // do we send command with endpoint suffix
-      char command_suffix[4] = { 0x00 };  // empty string by default
-      // if SO101 and multiple endpoints, append endpoint number
-      if (Settings->flag4.zb_index_ep) {
-        if (zigbee_devices.getShortAddr(shortaddr).countEndpoints() > 0) {
-          snprintf_P(command_suffix, sizeof(command_suffix), PSTR("%d"), srcendpoint);
-        }
-      }
       if (0 == xyz.x_type) {
-        attr_list.addAttribute(command_name, command_suffix).setBool(true);
+        attr_list.addAttribute(command_name).setBool(true);
       } else if (0 == xyz.y_type) {
-        attr_list.addAttribute(command_name, command_suffix).setUInt(xyz.x);
+        attr_list.addAttribute(command_name).setUInt(xyz.x);
       } else {
         // multiple answers, create an array
         JsonGeneratorArray arr;
@@ -529,7 +521,7 @@ void convertClusterSpecific(class Z_attribute_list &attr_list, uint16_t cluster,
         if (xyz.z_type) {
           arr.add(xyz.z);
         }
-        attr_list.addAttribute(command_name, command_suffix).setStrRaw(arr.toString().c_str());
+        attr_list.addAttribute(command_name).setStrRaw(arr.toString().c_str());
       }
     }
   }
@@ -610,19 +602,38 @@ static void replyTuyaTime( uint16_t cluster, uint16_t shortaddr, uint8_t dstendp
 bool convertTuyaSpecificCluster(class Z_attribute_list &attr_list, uint16_t cluster, uint8_t cmd, bool direction, uint16_t shortaddr, uint8_t srcendpoint, const SBuffer &buf) {
 
   if ((1 == cmd) || (2 == cmd)) {   // attribute report or attribute response
-    // uint16_t seq_number = buf.get16BigEndian(0)
-    uint8_t dpid = buf.get8(2);   // dpid from Tuya documentation
-    uint8_t attr_type = buf.get8(3);   // data type from Tuya documentation
-    uint16_t len = buf.get16BigEndian(4);
-    // create a synthetic attribute with id 'dpid'
-    Z_attribute & attr = attr_list.addAttribute(cluster, (attr_type << 8) | dpid);
-    parseSingleTuyaAttribute(attr, buf, 6, len, attr_type);
-    return true;    // true = remove the original Tuya attribute
+    uint16_t  read_index = 0; // position in the buffer
+    // uint16_t seq_number = buf.get16BigEndian(read_index); // seq
+    read_index += 2;
+
+    // continue while we can read at least 4 bytes: the dpid (u8), the type (u8), and the length (u16)
+    while ((read_index + 4) <= buf.len()) {
+      uint8_t dpid = buf.get8(read_index); // dpid
+      read_index++;
+      uint8_t attr_type = buf.get8(read_index); // data type
+      read_index++;
+      uint16_t len = buf.get16BigEndian(read_index);
+      read_index += 2;
+
+      // ensures we may read at least `len` bytes, if not, the payload is malformed.
+      if ((read_index + len) > buf.len()) {
+        break;
+      }
+
+      // create a synthetic attribute with id 'dpid'
+      Z_attribute & attr = attr_list.addAttribute(cluster, (attr_type << 8) | dpid);
+      parseSingleTuyaAttribute(attr, buf, read_index, len, attr_type);
+      read_index += len;
+    }
+
+    return true; // true = remove the original Tuya attribute
   }
+
   if (0x24 == cmd) {
     replyTuyaTime(cluster, shortaddr, srcendpoint);
     return true;
   }
+
   return false;
 }
 

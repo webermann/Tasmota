@@ -23,6 +23,8 @@
 #include <berry.h>
 #include "be_mem.h"
 #include "be_object.h"
+#include "include/ed25519.h"
+#include "crypto/refc/poly1305-donna.h"
 
 /*********************************************************************************************\
  * members class
@@ -59,6 +61,56 @@ extern "C" {
       uint8_t rand_bytes[n];
       esp_fill_random(rand_bytes, n);
       be_pushbytes(vm, rand_bytes, n);
+      be_return(vm);
+    }
+    be_raise(vm, kTypeError, nullptr);
+  }
+}
+
+/*********************************************************************************************\
+ * RSA class
+ * 
+\*********************************************************************************************/
+extern "C" {
+  // crypto.RSA.rsassa_pkcs1_v1_5(private_key:bytes(), msg:bytes()) -> bytes()
+  // Parses RSA private key from DER binary
+  int32_t m_rsa_rsassa_pkcs1_v1_5(bvm *vm);
+  int32_t m_rsa_rsassa_pkcs1_v1_5(bvm *vm) {
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc >= 2 && be_isbytes(vm, 1)) {
+      size_t sk_len = 0;
+      uint8_t * sk_der = (uint8_t*) be_tobytes(vm, 1, &sk_len);
+      
+      // 1. decode the DER private key
+      br_skey_decoder_context sdc;
+      br_skey_decoder_init(&sdc);
+      br_skey_decoder_push(&sdc, sk_der, sk_len);
+      if (int ret = br_skey_decoder_last_error(&sdc)) {
+        be_raisef(vm, "value_error", "invalid private key %i", ret);
+      }
+      if (br_skey_decoder_key_type(&sdc) != BR_KEYTYPE_RSA) {
+        be_raise(vm, "value_error", "key is not RSA");
+      }
+      const br_rsa_private_key *sk = br_skey_decoder_get_rsa(&sdc);
+      
+      // 2. Hash the message with SHA
+      size_t msg_len = 0;
+      uint8_t * msg = (uint8_t*) be_tobytes(vm, 2, &msg_len);
+      uint8_t hash[32];
+      br_sha256_context ctx;
+      br_sha256_init(&ctx);
+      br_sha256_update(&ctx, msg, msg_len);
+      br_sha256_out(&ctx, hash);
+
+      // 3. sign the message
+      size_t sign_len = (sk->n_bitlen + 7) / 8;
+      uint8_t x[sign_len] = {};
+      int err = br_rsa_i15_pkcs1_sign(BR_HASH_OID_SHA256,	hash, sizeof(hash), sk, x);
+      if (err != 1) {
+        be_raisef(vm, "value_error", "signature failed %i", err);
+      }
+
+      be_pushbytes(vm, x, sign_len);
       be_return(vm);
     }
     be_raise(vm, kTypeError, nullptr);
@@ -232,7 +284,9 @@ extern "C" {
         int ret = br_ccm_reset(ccm_ctx, nonce, nonce_len, aad_len, data_len, tag_len);
         if (ret == 0) { be_raise(vm, "value_error", "br_ccm_reset failed"); }
 
-        br_ccm_aad_inject(ccm_ctx, aad, aad_len);
+        if (aad_len > 0) {
+          br_ccm_aad_inject(ccm_ctx, aad, aad_len);
+        }
         br_ccm_flip(ccm_ctx);
 
         be_return_nil(vm);
@@ -244,8 +298,8 @@ extern "C" {
 
   // Finish injection of authentication data
   int32_t m_aes_ccm_encrypt_or_decryt(bvm *vm, int encrypt);
-  int32_t m_aes_ccm_encryt(bvm *vm) { return m_aes_ccm_encrypt_or_decryt(vm, 1); }
-  int32_t m_aes_ccm_decryt(bvm *vm) { return m_aes_ccm_encrypt_or_decryt(vm, 0); }
+  int32_t m_aes_ccm_encrypt(bvm *vm) { return m_aes_ccm_encrypt_or_decryt(vm, 1); }
+  int32_t m_aes_ccm_decrypt(bvm *vm) { return m_aes_ccm_encrypt_or_decryt(vm, 0); }
   int32_t m_aes_ccm_encrypt_or_decryt(bvm *vm, int encrypt) {
     int32_t argc = be_top(vm); // Get the number of arguments
     if (argc >= 2 && be_isbytes(vm, 2)) {
@@ -292,6 +346,119 @@ extern "C" {
       be_return(vm);
       // success
     } while (0);
+    be_raise(vm, kTypeError, nullptr);
+  }
+
+  // `AES_CCM.decrypt1(
+  //      secret_key:bytes(16 or 32),
+  //      iv:bytes(), iv_start:int, iv_len:int (7..13),
+  //      aad:bytes(), aad_start:int, aad_len:int,
+  //      data:bytes(), data_start:int, data_len:int,
+  //      tag:bytes(), tag_start:int, tag_len:int (4..16))
+  //      -> bool (true if tag matches)
+  //
+  // all-in-one decrypt function
+  // decryption in place
+  //
+  int32_t m_aes_ccm_encrypt1_or_decryt1(bvm *vm, int encrypt);
+  int32_t m_aes_ccm_encrypt1(bvm *vm) { return m_aes_ccm_encrypt1_or_decryt1(vm, 1); }
+  int32_t m_aes_ccm_decrypt1(bvm *vm) { return m_aes_ccm_encrypt1_or_decryt1(vm, 0); }
+  int32_t m_aes_ccm_encrypt1_or_decryt1(bvm *vm, int encrypt) {
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc >= 13 && be_isbytes(vm, 1)    // secret_key
+                   && be_isbytes(vm, 2) && be_isint(vm, 3) && be_isint(vm, 4) // iv, iv_start, iv_len
+                   && be_isbytes(vm, 5) && be_isint(vm, 6) && be_isint(vm, 7) // aad, aad_start, aad_len
+                   && be_isbytes(vm, 8) && be_isint(vm, 9) && be_isint(vm, 10) // data_start, data_len
+                   && be_isbytes(vm, 11) && be_isint(vm, 12) && be_isint(vm, 13)) { // tag, tag_start, tag_len
+
+      size_t key_len = 0;
+      const void * key = be_tobytes(vm, 1, &key_len);
+      if (key_len != 32 && key_len != 16) {
+        be_raise(vm, "value_error", "Key size must be 16 or 32 bytes");
+      }
+
+      size_t nonce_len = 0;
+      const uint8_t * nonce = (const uint8_t *) be_tobytes(vm, 2, &nonce_len);
+      int32_t n_start = be_toint(vm, 3);
+      int32_t n_len = be_toint(vm, 4);
+      if (n_start < 0 || n_len < 0 || n_start > nonce_len || n_start+n_len > nonce_len) {
+        be_raise(vm, "range_error", "out of range start/end");
+      }
+      nonce += n_start;
+      nonce_len = n_len;
+      if (nonce_len < 7 || nonce_len > 13) {
+        be_raise(vm, "value_error", "Nonce size must be 7..13");
+      }
+
+      size_t aad_len = 0;
+      const uint8_t * aad = (const uint8_t *) be_tobytes(vm, 5, &aad_len);
+      int32_t a_start = be_toint(vm, 6);
+      int32_t a_len = be_toint(vm, 7);
+      if (a_start < 0 || a_len < 0 || a_start  > aad_len || a_start+a_len > aad_len) {
+        be_raise(vm, "range_error", "out of range start/end");
+      }
+      aad += a_start;
+      aad_len = a_len;
+
+      size_t data_len = 0;
+      uint8_t * data = (uint8_t *) be_tobytes(vm, 8, &data_len);
+      int32_t d_start = be_toint(vm, 9);
+      int32_t d_len = be_toint(vm, 10);
+      if (d_start < 0 || d_len < 0 || d_start  > data_len || d_start+d_len > data_len) {
+        be_raise(vm, "range_error", "out of range start/end");
+      }
+      data += d_start;
+      data_len = d_len;
+
+      size_t tag_len = 0;
+      uint8_t * tag = (uint8_t *) be_tobytes(vm, 11, &tag_len);
+      int32_t t_start = be_toint(vm, 12);
+      int32_t t_len = be_toint(vm, 13);
+      if (t_start < 0 || t_len < 0 || t_start  > tag_len || t_start+t_len > tag_len) {
+        be_raise(vm, "range_error", "out of range start/end");
+      }
+      tag += t_start;
+      tag_len = t_len;
+      if (tag_len < 4 || tag_len > 16) {
+        be_raise(vm, "value_error", "Tag size must be 4..16");
+      }
+
+      // Initialize an AES CCM structure with the secret key
+      br_aes_small_ctrcbc_keys key_ctx;
+      br_ccm_context ccm_ctx;
+      br_aes_small_ctrcbc_init(&key_ctx, key, key_len);
+      br_ccm_init(&ccm_ctx, &key_ctx.vtable);
+      int ret = br_ccm_reset(&ccm_ctx, nonce, nonce_len, aad_len, data_len, tag_len);
+      if (ret == 0) { be_raise(vm, "value_error", "br_ccm_reset failed"); }
+
+      if (aad_len > 0) {
+        br_ccm_aad_inject(&ccm_ctx, aad, aad_len);
+      }
+      br_ccm_flip(&ccm_ctx);
+
+      br_ccm_run(&ccm_ctx, encrypt, data, data_len);  // decrypt in place
+
+      // check tag
+      // create a bytes buffer of 16 bytes
+      uint8_t tag_computed[16] = {};
+      br_ccm_get_tag(&ccm_ctx, tag_computed);
+
+      if (encrypt) {
+        // copy the tag back
+        memcpy(tag, tag_computed, tag_len);
+        be_pushbool(vm, btrue);
+      } else {
+        // check that the tag match
+        if (memcmp(tag_computed, tag, tag_len) == 0) {
+          be_pushbool(vm, btrue);
+        } else {
+          be_pushbool(vm, bfalse);
+        }
+      }
+
+      // success
+      be_return(vm);
+    }
     be_raise(vm, kTypeError, nullptr);
   }
 }
@@ -365,6 +532,162 @@ extern "C" {
       } while (0);
     }
     be_raise(vm, kTypeError, nullptr);
+  }
+}
+
+/*********************************************************************************************\
+ * AES_CBC class
+ * 
+\*********************************************************************************************/
+extern "C" {
+  // `AES_CBC.encrypt1(secret_key:bytes(16),iv:bytes(16),data:bytes(n*16))-> bool (true)
+  int32_t m_aes_cbc_encrypt1(bvm *vm);
+  int32_t m_aes_cbc_encrypt1(bvm *vm) {
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc >= 3  && be_isbytes(vm, 1)    // secret_key  - 16 bytes
+                   && be_isbytes(vm, 2)    // iv          - 16 bytes
+                   && be_isbytes(vm, 3)    // data/cipher - multiple 16 bytes
+                   ) {
+
+      size_t key_len = 0;
+      const void * key = be_tobytes(vm, 1, &key_len);
+      if (key_len != 16) {
+        be_raise(vm, "value_error", "Key size must be 16 bytes");
+      }
+
+      size_t iv_len = 0;
+      void * iv = (void *) be_tobytes(vm, 2, &iv_len);
+      if (iv_len != 16) {
+        be_raise(vm, "value_error", "IV size must be 16");
+      }
+
+      size_t data_len = 0;
+      void * data = (void *) be_tobytes(vm, 3, &data_len);
+      if (data_len%16 != 0) {
+        be_raise(vm, "value_error", "Data size must be multiple of 16");
+      }
+
+      // Initialize an AES CBC encryption structure with the secret key, then run with IV and data
+      br_aes_small_cbcenc_keys cbc_ctx;
+      br_aes_small_cbcenc_init(&cbc_ctx, key, 16);
+      br_aes_small_cbcenc_run( &cbc_ctx, iv, data, data_len );
+      
+      // (unchecked )success
+      be_pushbool(vm, btrue);
+      be_return(vm);
+    }
+    be_raise(vm, kTypeError, nullptr);
+  }
+  // `AES_CBC.decrypt1(secret_key:bytes(16),iv:bytes(16),cipher:bytes(n*16))-> bool (true)
+  int32_t m_aes_cbc_decrypt1(bvm *vm);
+  int32_t m_aes_cbc_decrypt1(bvm *vm) {
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc >= 3  && be_isbytes(vm, 1)    // secret_key  - 16 bytes
+                   && be_isbytes(vm, 2)    // iv          - 16 bytes
+                   && be_isbytes(vm, 3)    // cipher/data - multiple 16 bytes
+                   ) {
+
+      size_t key_len = 0;
+      const void * key = be_tobytes(vm, 1, &key_len);
+      if (key_len != 16) {
+        be_raise(vm, "value_error", "Key size must be 16 bytes");
+      }
+
+      size_t iv_len = 0;
+      void * iv = (void *) be_tobytes(vm, 2, &iv_len);
+      if (iv_len != 16) {
+        be_raise(vm, "value_error", "IV size must be 16");
+      }
+
+      size_t data_len = 0;
+      void * data = (void *) be_tobytes(vm, 3, &data_len);
+      if (data_len%16 != 0) {
+        be_raise(vm, "value_error", "Cipher size must be multiple of 16");
+      }
+
+      // Initialize an AES CBC decryption structure with the secret key, then run with IV and data
+      br_aes_small_cbcdec_keys cbc_ctx;
+      br_aes_small_cbcdec_init(&cbc_ctx, key, 16);
+      br_aes_small_cbcdec_run( &cbc_ctx, iv, data, data_len );
+      
+      // (unchecked )success
+      be_pushbool(vm, btrue);
+      be_return(vm);
+    }
+    be_raise(vm, kTypeError, nullptr);
+  }
+}
+
+/*********************************************************************************************\
+ * CHACHA20-POLY1305  class
+ * 
+\*********************************************************************************************/
+extern "C" {
+
+   // `chacha20_run(secret_key:bytes(32),iv:bytes(12),cipher:bytes(n*16),)-> int counter
+  int32_t m_chacha20_run(bvm *vm) {
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc >= 4  && be_isbytes(vm, 1)    // secret_key  - 32 bytes
+                   && be_isbytes(vm, 2)    // iv/nonce    - 12 bytes
+                   && be_isint(vm, 3)      // counter
+                   && be_isbytes(vm, 4)    // data/cipher
+                   ) {
+
+      size_t key_len = 0;
+      const void * key = be_tobytes(vm, 1, &key_len);
+      if (key_len != 32) {
+        AddLog(LOG_LEVEL_INFO, PSTR(" %d bytes"), key_len);
+        be_raise(vm, "value_error", "Key size must be 32 bytes");
+      }
+
+      size_t iv_len = 0;
+      void * iv = (void *) be_tobytes(vm, 2, &iv_len);
+      if (iv_len != 12) {
+        AddLog(LOG_LEVEL_INFO, PSTR(" %d bytes"), iv_len);
+        be_raise(vm, "value_error", "IV size must be 12");
+      }
+
+      int32_t cc = be_toint(vm, 3);
+
+      size_t data_len = 0;
+      void * data = (void *) be_tobytes(vm, 4, &data_len);
+
+      br_chacha20_run bc = br_chacha20_ct_run;
+    
+      int32_t new_cc = br_chacha20_ct_run(key, iv, cc, data, data_len);
+
+      be_pushint(vm, new_cc);
+      be_return(vm);
+    }
+    be_raise(vm, kTypeError, nullptr);
+  }
+
+  // `poly_run(data:bytes(),poly_key:bytes(32),)-> tag:bytes(16)`
+  int m_poly1305_run(bvm *vm){
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc >= 2 && be_isbytes(vm, 1)    // data in
+                  && be_isbytes(vm, 2)    // poly key
+    ) {
+      unsigned char tag[16];
+
+      size_t data_len = 0;
+      const unsigned char * data = (const unsigned char *) be_tobytes(vm, 1, &data_len);
+
+      size_t polykey_len = 0;
+      const unsigned char * polykey = (const unsigned char *) be_tobytes(vm, 2, &polykey_len);
+      if (polykey_len != 32) {
+        AddLog(LOG_LEVEL_INFO, PSTR(" %d bytes"), polykey_len);
+        be_raise(vm, "value_error", "poly key size must be 32 bytes");
+      }
+      poly1305_context ctx;
+      poly1305_init(&ctx, polykey);
+      poly1305_update(&ctx, data, data_len);
+      poly1305_finish(&ctx, tag);
+
+      be_pushbytes(vm, tag, sizeof(tag));
+      be_return(vm); 
+    }
+  be_raise(vm, kTypeError, nullptr);
   }
 }
 
@@ -720,11 +1043,10 @@ extern "C" {
   // 11015125C6780B2BCE1D4F68F362692B7D73BC7FFF7FFF7FFF7FFF0F00000040FF7FFF7F0100
 
   // N=bytes('11015125C6780B2BCE1D4F68F362692B7D73BC7FFF7FFF7FFF7FFF0F00000040FF7FFF7F0100')
-  // import string
   // s = ''
   // while size(N) > 0
   //   var n = N.get(0, 2)
-  //   s += string.format("0x%04X, ", n)
+  //   s += format("0x%04X, ", n)
   //   N = N[2..]
   // end
   // print(s)
@@ -923,6 +1245,174 @@ extern "C" {
         }
       }
       be_raise(vm, "value_error", "invalid input");
+    }
+    be_raise(vm, kTypeError, nullptr);
+  }
+}
+
+  /*********************************************************************************************\
+ * ED25519 class
+ * 
+\*********************************************************************************************/
+extern "C" {
+  /* internal function to generate a secret key from a seed
+   * The secret key is 64 bytes long, the first 32 bytes are the seed
+   * and the last 32 bytes are the public key.
+   * The seed must be 32 bytes long.
+  */
+  void _ed25519_get_secret_key(unsigned char *private_key, const unsigned char *seed){
+    ge_p3 A;
+    unsigned char pub_key[32];
+
+    br_sha512_context ctx;
+    br_sha512_init(&ctx);
+    br_sha512_update(&ctx, seed, 32);
+    br_sha512_out(&ctx, private_key);
+    private_key[0] &= 248;
+    private_key[31] &= 63;
+    private_key[31] |= 64;
+
+    ge_scalarmult_base(&A, private_key);
+    ge_p3_tobytes(pub_key, &A);
+    memmove(private_key, seed, 32);
+    memmove(private_key + 32, pub_key, 32);
+  }
+
+  /*crypto.ED25519().secret_key(seed:bytes(32)) -> bytes(64)*/
+  int32_t m_ed25519_secret_key(bvm *vm) {
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc == 2 && be_isbytes(vm, 2))  // seed
+    {
+      size_t seed_len = 0;
+      const unsigned char * seed = (const unsigned char *) be_tobytes(vm, 2, &seed_len);
+      if (seed_len != 32) {
+        be_raise(vm, "value_error", "seed size must be 32");
+      }
+      unsigned char sec_key[64];
+
+      _ed25519_get_secret_key(sec_key, seed);
+      be_pushbytes(vm, sec_key, 64);
+      be_return(vm);
+    }
+    be_raise(vm, kTypeError, nullptr);
+  }
+
+
+  // https://github.com/rdeker/ed25519/blob/13a0661670949bc2e1cfcd8720082d9670768041/src/sign.c
+  /*crypto.ED25519().sign(message:bytes(), secret_key:bytes(64)) -> signature:bytes(64)*/
+  int32_t m_ed25519_sign(bvm *vm) {
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc == 3 && be_isbytes(vm, 2)  // message
+                  && be_isbytes(vm, 3))  // secret key
+                  {
+      size_t msg_len = 0;
+      const void * msg = be_tobytes(vm, 2, &msg_len);
+
+      size_t sec_key_len = 0;
+      void * sec_key = (void *) be_tobytes(vm, 3, &sec_key_len);
+      if (sec_key_len != 64) {
+        be_raise(vm, "value_error", "Key size must be 64");
+      }
+
+      uint8_t sign[64];
+      unsigned char hram[64];
+      unsigned char r[64];
+      unsigned char az[64];
+      ge_p3 R;
+
+      br_sha512_context ctx;
+
+      br_sha512_init(&ctx);
+      br_sha512_update(&ctx, (unsigned char*)sec_key, 32);
+      br_sha512_out(&ctx, az);
+      az[0] &= 248;
+      az[31] &= 63;
+      az[31] |= 64;
+
+      br_sha512_init(&ctx);
+      br_sha512_update(&ctx, az + 32, 32);
+      br_sha512_update(&ctx, msg, msg_len);
+      br_sha512_out(&ctx, r);
+
+      memmove((unsigned char*)sign + 32, (unsigned char*)sec_key + 32, 32);
+      // memmove((unsigned char*)sign + 32, (unsigned char*)pub_key, 32);
+  
+      sc_reduce(r);
+      ge_scalarmult_base(&R, r);
+      ge_p3_tobytes((unsigned char*)sign, &R);
+
+
+      br_sha512_init(&ctx);
+      br_sha512_update(&ctx, sign, 64);
+      br_sha512_update(&ctx, msg, msg_len);
+      br_sha512_out(&ctx, hram);
+  
+      sc_reduce(hram);
+      sc_muladd((unsigned char*)sign + 32, hram, az, r);
+
+      be_pushbytes(vm, sign, 64);
+      be_return(vm);
+    }
+    be_raise(vm, kTypeError, nullptr);
+  }
+
+  // https://github.com/rdeker/ed25519/blob/13a0661670949bc2e1cfcd8720082d9670768041/src/verify.c
+  /*crypto.ED25519().verify(message:bytes(), signature:bytes(64), public_key:bytes(32)) -> bool*/
+  int32_t m_ed25519_verify(bvm *vm) {
+    int32_t argc = be_top(vm); // Get the number of arguments
+    if (argc >= 4 && be_isbytes(vm, 2)  // message
+                  && be_isbytes(vm, 3)  // signature
+                  && be_isbytes(vm, 4)) // public key
+                  {
+      size_t message_len = 0;
+      const void * message = be_tobytes(vm, 2, &message_len);
+
+      size_t sign_len = 0;
+      const unsigned char * signature = (const unsigned char *) be_tobytes(vm, 3, &sign_len);
+      if (sign_len != 64) {
+        be_raise(vm, "value_error", "signature size must be 64");
+      }
+
+      size_t pub_key_len = 0;
+      const unsigned char * public_key = (const unsigned char *) be_tobytes(vm, 4, &pub_key_len);
+      if (pub_key_len != 32) {
+        be_raise(vm, "value_error", "key size must be 32");
+      }
+
+      unsigned char h[64];
+      unsigned char checker[32];
+      br_sha512_context ctx;
+
+      ge_p3 A;
+      ge_p2 R;
+  
+      bbool success = false;
+      if (signature[63] & 224) {
+        AddLog(LOG_LEVEL_INFO, PSTR(" signature[63] & 224"));
+          goto eddsa_verify_exit;
+      }
+  
+      if (ge_frombytes_negate_vartime(&A, public_key) != 0) {
+        AddLog(LOG_LEVEL_INFO, PSTR(" ge_frombytes_negate_vartime(&A, public_key) != 0"));
+          goto eddsa_verify_exit;
+      }
+
+      br_sha512_init(&ctx);
+      br_sha512_update(&ctx, signature, 32);
+      br_sha512_update(&ctx, public_key, 32);
+      br_sha512_update(&ctx, message, message_len);
+      br_sha512_out(&ctx, h);
+  
+      sc_reduce(h);
+      ge_double_scalarmult_vartime(&R, h, &A, signature + 32);
+      ge_tobytes(checker, &R);
+  
+      if (memcmp(checker, signature, 32) == 0) {
+          success = true;
+      }
+eddsa_verify_exit:
+      be_pushbool(vm, success);
+      be_return(vm);
     }
     be_raise(vm, kTypeError, nullptr);
   }

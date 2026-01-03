@@ -741,6 +741,9 @@ void EnergyModbusSnsInit(void) {
     uint8_t result = EnergyModbus->Begin(NrgMbsParam.serial_bps, NrgMbsParam.serial_config);
     if (result) {
       if (2 == result) { ClaimSerial(); }
+#ifdef ESP32
+      AddLog(LOG_LEVEL_DEBUG, PSTR("NRG: Serial UART%d"), EnergyModbus->getUart());
+#endif
 
 #ifdef ENERGY_MODBUS_TICKER
       ticker_energy_modbus.attach_ms(NrgMbsParam.ticker_poll, EnergyModbusLoop);
@@ -859,11 +862,7 @@ bool Xnrg29(uint32_t function) {
       EnergyModbusShow(1);
       break;
 #ifdef USE_WEBSERVER
-#ifdef USE_ENERGY_COLUMN_GUI
     case FUNC_WEB_COL_SENSOR:
-#else   // not USE_ENERGY_COLUMN_GUI
-    case FUNC_WEB_SENSOR:
-#endif  // USE_ENERGY_COLUMN_GUI
       EnergyModbusShow(0);
       break;
 #endif  // USE_WEBSERVER

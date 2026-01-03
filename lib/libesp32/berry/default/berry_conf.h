@@ -60,6 +60,14 @@
  **/
 #define BE_USE_PRECOMPILED_OBJECT       1
 
+/* Macro: BE_DEBUG_SOURCE_FILE
+ * Indicate if each function remembers its source file name
+ * 0: do not keep the file name (saves 4 bytes per function)
+ * 1: keep the source file name
+ * Default: 1
+ **/
+#define BE_DEBUG_SOURCE_FILE            0
+
 /* Macro: BE_DEBUG_RUNTIME_INFO
  * Set runtime error debugging information.
  * 0: unable to output source file and line number at runtime.
@@ -251,6 +259,7 @@
   #undef BE_USE_SOLIDIFY_MODULE
   #define BE_USE_DEBUG_MODULE             1
   #define BE_USE_SOLIDIFY_MODULE          1
+  #define BE_MAPPING_ENABLE_INPUT_VALIDATION   1    // input validation for lv_mapping
 #endif // USE_BERRY_DEBUG
 
 /* Macro: BE_EXPLICIT_XXX
@@ -259,7 +268,6 @@
  * are not required.
  * The default is to use the functions in the standard library.
  **/
-#ifdef USE_BERRY_PSRAM
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -270,6 +278,7 @@ extern "C" {
 #ifdef __cplusplus
 }
 #endif
+#ifdef USE_BERRY_PSRAM
   #define BE_EXPLICIT_MALLOC              berry_malloc
   #define BE_EXPLICIT_FREE                berry_free
   #define BE_EXPLICIT_REALLOC             berry_realloc
@@ -306,6 +315,10 @@ extern "C" {
     #undef BE_STACK_START
     #define BE_STACK_START                  200
   #endif // USE_LVGL
+  #ifdef USE_MATTER_DEVICE
+    #undef BE_STACK_START
+    #define BE_STACK_START                  256
+  #endif // USE_MATTER_DEVICE
 #endif // USE_BERRY_DEBUG
 
 #endif

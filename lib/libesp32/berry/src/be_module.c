@@ -36,14 +36,14 @@
   #endif
 #endif
 
-extern BERRY_LOCAL const bntvmodule* const be_module_table[];
+extern BERRY_LOCAL const bntvmodule_t* const be_module_table[];
 
-static bmodule* native_module(bvm *vm, const bntvmodule *nm, bvalue *dst);
+static bmodule* native_module(bvm *vm, const bntvmodule_t *nm, bvalue *dst);
 
-static const bntvmodule* find_native(bstring *path)
+static const bntvmodule_t* find_native(bstring *path)
 {
-    const bntvmodule *module;
-    const bntvmodule* const *node = be_module_table;
+    const bntvmodule_t *module;
+    const bntvmodule_t* const *node = be_module_table;
     for (; (module = *node) != NULL; ++node) {
         if (!strcmp(module->name, str(path))) {
             return module;
@@ -52,11 +52,11 @@ static const bntvmodule* find_native(bstring *path)
     return NULL;
 }
 
-static void insert_attrs(bvm *vm, bmap *table, const bntvmodule *nm)
+static void insert_attrs(bvm *vm, bmap *table, const bntvmodule_t *nm)
 {
     size_t i;
     for (i = 0; i < nm->size; ++i) {
-        const bntvmodobj *node = nm->attrs + i;
+        const bntvmodobj_t *node = nm->attrs + i;
         bstring *name = be_newstr(vm, node->name);
         bvalue *v = be_map_insertstr(vm, table, name, NULL);
         be_assert(node->type <= BE_CMODULE);
@@ -88,7 +88,7 @@ static void insert_attrs(bvm *vm, bmap *table, const bntvmodule *nm)
     }
 }
 
-static bmodule* new_module(bvm *vm, const bntvmodule *nm)
+static bmodule* new_module(bvm *vm, const bntvmodule_t *nm)
 {
     bgcobject *gco = be_gcnew(vm, BE_MODULE, bmodule);
     bmodule *obj = cast_module(gco);
@@ -105,7 +105,7 @@ static bmodule* new_module(bvm *vm, const bntvmodule *nm)
     return obj;
 }
 
-static bmodule* native_module(bvm *vm, const bntvmodule *nm, bvalue *dst)
+static bmodule* native_module(bvm *vm, const bntvmodule_t *nm, bvalue *dst)
 {
     if (nm) {
         bmodule *obj;
@@ -126,13 +126,17 @@ static char* fixpath(bvm *vm, bstring *path, size_t *size)
 {
     char *buffer;
     const char *split, *base;
+#if BE_DEBUG_SOURCE_FILE
     bvalue *func = vm->cf->func;
     bclosure *cl = var_toobj(func);
     if (var_isclosure(func)) {
         base = str(cl->proto->source); /* get the source file path */
     } else {
-        base = "/";
+        base = "";
     }
+#else
+    base = "";
+#endif
     split = be_splitpath(base);
     *size = split - base + (size_t)str_len(path) + SUFFIX_LEN;
     buffer = be_malloc(vm, *size);
@@ -179,11 +183,14 @@ static int open_libfile(bvm *vm, char *path, size_t size)
         strcpy(path + size - SUFFIX_LEN, sfxs[idx]);
         res = open_script(vm, path);
     } while (idx++ < 2 && res == BE_IO_ERROR);
-    if (res == BE_IO_ERROR) {
 #if BE_USE_SHARED_LIB
+    if (res == BE_IO_ERROR) {
         strcpy(path + size - SUFFIX_LEN, DLL_SUFFIX);
         res = open_dllib(vm, path);
+    }
 #endif
+    if (res == BE_EXCEPTION) {
+        be_dumpexcept(vm);
     }
     be_free(vm, path, size);
     return res;
@@ -221,7 +228,7 @@ static int load_package(bvm *vm, bstring *path)
 
 static int load_native(bvm *vm, bstring *path)
 {
-    const bntvmodule *nm = find_native(path);
+    const bntvmodule_t *nm = find_native(path);
     bmodule *mod = native_module(vm, nm, NULL);
     if (mod != NULL) {
         /* the pointer vm->top may be changed */
@@ -271,8 +278,8 @@ static void module_init(bvm *vm) {
     }
 }
 
-/* load module to vm->top */
-int be_module_load(bvm *vm, bstring *path)
+/* load module to vm->top, option to cache or not */
+int be_module_load_nocache(bvm *vm, bstring *path, bbool nocache)
 {
     int res = BE_OK;
     if (!load_cached(vm, path)) {
@@ -280,12 +287,20 @@ int be_module_load(bvm *vm, bstring *path)
         if (res == BE_IO_ERROR)
             res = load_package(vm, path);
         if (res == BE_OK) {
-            /* on first load of the module, try running the '()' function */
+            /* on first load of the module, try running the 'init' function */
             module_init(vm);
-            be_cache_module(vm, path);
+            if (!nocache) { /* cache the module if it is loaded successfully */
+                be_cache_module(vm, path);
+            }
         }
     }
     return res;
+}
+
+/* load module to vm->top */
+int be_module_load(bvm *vm, bstring *path)
+{
+    return be_module_load_nocache(vm, path, bfalse);
 }
 
 BERRY_API bbool be_getmodule(bvm *vm, const char *k)
@@ -351,7 +366,7 @@ int be_module_attr(bvm *vm, bmodule *module, bstring *attr, bvalue *dst)
 
 bbool be_module_setmember(bvm *vm, bmodule *module, bstring *attr, bvalue *src)
 {
-    assert(src);
+    be_assert(src);
     bmap *attrs = module->table;
     if (!gc_isconst(attrs)) {
         bvalue *v = be_map_findstr(vm, attrs, attr);
@@ -392,7 +407,7 @@ bbool be_module_setmember(bvm *vm, bmodule *module, bstring *attr, bvalue *src)
     return bfalse;
 }
 
-const char* be_module_name(bmodule *module)
+const char* be_module_name(const bmodule *module)
 {
     if (gc_isconst(module)) {
         return module->info.name;

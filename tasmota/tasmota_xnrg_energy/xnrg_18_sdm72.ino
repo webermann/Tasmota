@@ -136,6 +136,9 @@ void Sdm72SnsInit(void)
     if (2 == result) {
         ClaimSerial();
     }
+#ifdef ESP32
+    AddLog(LOG_LEVEL_DEBUG, PSTR("SDM: Serial UART%d"), Sdm72Modbus->getUart());
+#endif
   } else {
     TasmotaGlobal.energy_driver = ENERGY_NONE;
   }
@@ -183,11 +186,7 @@ bool Xnrg18(uint32_t function)
       Sdm72Show(1);
       break;
 #ifdef USE_WEBSERVER
-#ifdef USE_ENERGY_COLUMN_GUI
     case FUNC_WEB_COL_SENSOR:
-#else   // not USE_ENERGY_COLUMN_GUI
-    case FUNC_WEB_SENSOR:
-#endif  // USE_ENERGY_COLUMN_GUI
       Sdm72Show(0);
       break;
 #endif  // USE_WEBSERVER
